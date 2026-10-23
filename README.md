@@ -90,35 +90,54 @@ must also be done consistently (for example by UID). The adapter does not expand
 
 ## Docker Compose + Cloudflare Tunnel
 
-This runs two containers: the adapter and `cloudflared`. No host ports are published,
-no router port forwarding is needed, and Cloudflare provides HTTPS at your hostname.
-The host must stay running for calendar subscriptions to refresh.
+This stack runs **only the adapter**. It connects to an existing `cloudflared` container
+managed in another Compose project through a shared external Docker network. No host
+ports are published and no Cloudflare credentials are stored in this project.
+Both containers must run on the same Docker host, which must stay running for refreshes.
 
-### 1. Create a tunnel and hostname
+### 1. Share a network with your existing tunnel
 
-Prerequisites: Docker Engine with the Compose v2 plugin, a Cloudflare account, and
-a domain managed by Cloudflare. This setup uses a **remotely managed named tunnel**,
-not a temporary Quick Tunnel whose URL changes.
+Prerequisites: Docker Engine with Compose v2, an existing working Cloudflare Tunnel,
+and a domain managed by Cloudflare. The examples use a network named `cloudflared`.
+If your tunnel already uses a suitable network, reuse its actual Docker network name
+instead, and set `TUNNEL_NETWORK` accordingly in step 2.
 
-1. Open the [Cloudflare dashboard](https://one.dash.cloudflare.com/) and find
-   **Networks → Tunnels** (depending on the dashboard version, this may be under
-   **Networks → Connectors → Cloudflare Tunnels**).
-2. Create a **Cloudflared** tunnel, e.g. `timeedit-adapter`.
-3. Select the Docker connector instructions and copy the **tunnel token**. Do not
-   run Cloudflare's example Docker command: Compose will run the connector instead.
-   This token is not an API token and should be kept secret.
-4. Add a **Published application route / Public hostname**:
-   - Hostname: e.g. `calendar.example.com` on your Cloudflare domain.
-   - Service type: **HTTP**, not HTTPS.
-   - Service URL: **`adapter:8000`** (equivalently `http://adapter:8000`).
-   - Leave the path empty to route all paths to this service.
-5. Save the route; let Cloudflare create its DNS record. If the wizard requires the
-   connector to come online first, start Compose in step 2, then return to add the route.
+To create a dedicated shared network (once, if it does not already exist):
 
-`adapter` is the Compose service name. Do **not** use `localhost:8000` in Cloudflare:
-inside the `cloudflared` container, localhost refers to the connector, not the adapter.
-Traffic from calendar clients to Cloudflare uses HTTPS; the container-to-container
-hop uses HTTP over Docker's network and the connection to Cloudflare is encrypted.
+```sh
+docker network create cloudflared
+```
+
+In your **existing cloudflared Compose file**, attach the connector service to this
+external network. Merge this into the existing configuration, retaining its command,
+credentials, and any other networks needed by your other applications:
+
+```yaml
+services:
+  cloudflared:
+    # Keep your existing configuration here.
+    networks:
+      - default
+      - tunnel
+
+networks:
+  default: {}
+  tunnel:
+    external: true
+    name: cloudflared
+```
+
+From that other Compose project's directory, apply the change:
+
+```sh
+docker compose up -d cloudflared
+```
+
+Use your actual connector service name if it is not `cloudflared`. Recreating the
+connector may briefly interrupt other applications served by that tunnel.
+For a temporary attachment without editing that project, you can instead run
+`docker network connect cloudflared <existing-cloudflared-container-name>`, but this
+attachment will be lost when the container is recreated. The Compose change is preferred.
 
 ### 2. Configure and start
 
@@ -129,23 +148,43 @@ cp .env.example .env
 chmod 600 .env
 ```
 
-Edit `.env`, setting `CLOUDFLARE_TUNNEL_TOKEN` to the token from step 1. The file is
-gitignored and excluded from the Docker build. Compose reads it automatically; the
-token is passed only to `cloudflared`, not the adapter. Docker administrators can
-still inspect container environment variables. Avoid sharing `docker compose config`
-output, because it contains the expanded token.
+Set `TUNNEL_NETWORK` in `.env` to your shared network's name (default: `cloudflared`).
+Compose reads `.env` automatically. No tunnel token is needed here. If upgrading from
+the earlier two-container setup, remove `CLOUDFLARE_TUNNEL_TOKEN` and `CLOUDFLARED_IMAGE`
+from your old `.env`; the existing tunnel's credentials stay in its own project.
 
 ```sh
 docker compose up -d --build
 docker compose ps
-docker compose logs --tail=50 cloudflared
+docker compose logs --tail=50 adapter
 ```
 
-`cloudflared` starts after the adapter passes its health check. You should see
-registered tunnel connections in the logs and a healthy tunnel in Cloudflare.
-No local Python/uv installation is required for this deployment.
+No local Python/uv installation is required. If an earlier version of this project
+already started its own connector, `docker compose up -d --build --remove-orphans`
+also removes that old project-owned connector. This does not remove containers from
+your other Compose project; make sure you use a distinct Compose project name.
 
-### 3. Verify and subscribe
+### 3. Configure your existing tunnel's hostname
+
+In the Cloudflare dashboard, open your **existing tunnel** and add a published
+application route / public hostname:
+
+- Hostname: e.g. `calendar.example.com` on your Cloudflare domain.
+- Service type: **HTTP**, not HTTPS.
+- Service URL: **`timeedit-adapter:8000`** (equivalently `http://timeedit-adapter:8000`).
+- Leave the path empty to route all paths to this service.
+
+`timeedit-adapter` is the adapter's alias on the shared network. Do not use
+`localhost:8000`: that would refer to the connector container itself. Avoid giving
+another container the same alias on this network. For a locally managed tunnel,
+use `service: http://timeedit-adapter:8000` in its hostname ingress rule instead,
+then reload/restart your connector as appropriate.
+
+Cloudflare provides HTTPS to clients; the container-to-container hop uses HTTP over
+Docker's network. No router port forwarding is needed. Use a normal bridge network
+with outbound internet access so the adapter can reach TimeEdit, not an internal-only network.
+
+### 4. Verify and subscribe
 
 Replace `calendar.example.com` with your actual hostname:
 
@@ -180,35 +219,36 @@ or the Dockerfile, rebuild with `docker compose up -d --build`. After changing `
 use `docker compose up -d` to recreate affected containers; a restart alone does not
 apply environment changes. Cached feeds are lost on adapter restarts.
 
-To pull an updated connector image and rebuild the adapter with fresh base images:
+To rebuild the adapter with fresh base images:
 
 ```sh
-docker compose pull cloudflared
 docker compose build --pull adapter
 docker compose up -d
 ```
 
-The Python packages are pinned by `uv.lock`. Base/connector images use floating tags;
-pin the Dockerfile image references and `CLOUDFLARED_IMAGE` to tags/digests if you need
-fully reproducible deployments. Updates are manual, not automatic.
+The Python packages are pinned by `uv.lock`. Base images use floating tags; pin the
+Dockerfile image references to tags/digests for fully reproducible deployments.
+Update your connector separately in its own Compose project.
 
-To stop both services:
+To stop the adapter:
 
 ```sh
 docker compose down
 ```
 
-This does not delete the tunnel or DNS record in Cloudflare. Remove those separately
-in Cloudflare if you no longer want to publish the service.
+This leaves your existing connector, external Docker network, and Cloudflare routes
+untouched. Remove the calendar hostname separately if you no longer want to publish it.
 
 Troubleshooting:
 
 - **Adapter unhealthy:** `docker compose logs --tail=50 adapter`; check for syntax
   errors in `transforms.py` and ensure the host file is readable by container UID 10001.
-- **Cloudflare 502:** verify the route targets **HTTP `adapter:8000`** and both containers
-  are running. Do not point the route at your host's localhost.
-- **Tunnel disconnected:** check the token and outbound network access. Cloudflare
-  Tunnel needs outbound port 7844 (UDP for QUIC or TCP for HTTP/2).
+- **Network not found:** create the shared network or correct `TUNNEL_NETWORK`.
+- **Cloudflare 502:** verify the route targets **HTTP `timeedit-adapter:8000`**, both
+  containers are running, and both are attached to the same Docker network.
+  `docker network inspect cloudflared` lists attached containers.
+- **Tunnel disconnected:** check the connector in its own Compose project. This
+  project does not start or configure the tunnel connector itself.
 - **Adapter 502:** the tunnel is working, but fetching or parsing the TimeEdit feed failed.
 
 ## Subscribe from Google Calendar

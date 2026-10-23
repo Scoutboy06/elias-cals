@@ -3,6 +3,10 @@ services:
     build: .
     restart: unless-stopped
     init: true
+    networks:
+      tunnel:
+        aliases:
+          - timeedit-adapter
     environment:
       CACHE_TTL_SECONDS: ${CACHE_TTL_SECONDS:-600}
       STALE_TTL_SECONDS: ${STALE_TTL_SECONDS:-86400}
@@ -29,17 +33,7 @@ services:
       start_period: 10s
       retries: 3
 
-  cloudflared:
-    image: ${CLOUDFLARED_IMAGE:-cloudflare/cloudflared:latest}
-    restart: unless-stopped
-    command: tunnel --no-autoupdate run
-    environment:
-      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:?Set CLOUDFLARE_TUNNEL_TOKEN in .env}
-    depends_on:
-      adapter:
-        condition: service_healthy
-    read_only: true
-    cap_drop:
-      - ALL
-    security_opt:
-      - no-new-privileges:true
+networks:
+  tunnel:
+    external: true
+    name: ${TUNNEL_NETWORK:-cloudflared}
